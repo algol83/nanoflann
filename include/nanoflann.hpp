@@ -56,6 +56,7 @@
 #include <istream>
 #include <limits>  // std::numeric_limits
 #include <ostream>
+#include <queue>
 #include <stack>
 #include <stdexcept>
 #include <unordered_set>
@@ -506,6 +507,13 @@ struct L1_Adaptor
 
     L1_Adaptor(const DataSource& _data_source) : data_source(_data_source) {}
 
+    DistanceType evalMetric(const T* from, const T* to, size_t size) const
+    {
+        DistanceType result = DistanceType();
+        for (size_t i = 0; i < size; i++) result += std::abs(from[i] - to[i]);
+        return result;
+    }
+
     DistanceType evalMetric(
         const T* a, const IndexType b_idx, size_t size,
         DistanceType worst_dist = -1) const
@@ -567,6 +575,17 @@ struct L2_Adaptor
     const DataSource& data_source;
 
     L2_Adaptor(const DataSource& _data_source) : data_source(_data_source) {}
+
+    DistanceType evalMetric(const T* from, const T* to, size_t size) const
+    {
+        DistanceType result = DistanceType();
+        for (size_t i = 0; i < size; i++)
+        {
+            const DistanceType diff = from[i] - to[i];
+            result += diff * diff;
+        }
+        return result;
+    }
 
     DistanceType evalMetric(
         const T* a, const IndexType b_idx, size_t size,
@@ -636,6 +655,17 @@ struct L2_Simple_Adaptor
     {
     }
 
+    DistanceType evalMetric(const T* from, const T* to, size_t size) const
+    {
+        DistanceType result = DistanceType();
+        for (size_t i = 0; i < size; ++i)
+        {
+            const DistanceType diff = from[i] - to[i];
+            result += diff * diff;
+        }
+        return result;
+    }
+
     DistanceType evalMetric(
         const T* a, const IndexType b_idx, size_t size) const
     {
@@ -677,6 +707,11 @@ struct SO2_Adaptor
     const DataSource& data_source;
 
     SO2_Adaptor(const DataSource& _data_source) : data_source(_data_source) {}
+
+    DistanceType evalMetric(const T* from, const T* to, size_t size) const
+    {
+        return accum_dist(from[size - 1], to[size - 1], size - 1);
+    }
 
     DistanceType evalMetric(
         const T* a, const IndexType b_idx, size_t size) const
@@ -725,6 +760,11 @@ struct SO3_Adaptor
     SO3_Adaptor(const DataSource& _data_source)
         : distance_L2_Simple(_data_source)
     {
+    }
+
+    DistanceType evalMetric(const T* from, const T* to, size_t size) const
+    {
+        return distance_L2_Simple.evalMetric(from, to, size);
     }
 
     DistanceType evalMetric(
@@ -1287,7 +1327,7 @@ class KDTreeBaseClass
             BoundingBox left_bbox(bbox);
             left_bbox[cutfeat].high = cutval;
             node->child1            = this->divideTreeConcurrent(
-                           obj, left, left + idx, left_bbox, thread_count, mutex);
+                obj, left, left + idx, left_bbox, thread_count, mutex);
 
             if (right_future.valid())
             {
@@ -1730,6 +1770,102 @@ class KDTreeSingleIndexAdaptor
         return result.full();
     }
 
+    template <typename RESULTSET>
+    bool findNeighbors2(
+        RESULTSET& result, const ElementType* vec,
+        const SearchParameters& searchParams = {}) const
+    {
+        assert(vec);
+        if (this->size(*this) == 0) return false;
+        if (!Base::root_node_)
+            throw std::runtime_error(
+                "[nanoflann] findNeighbors2() called before building the "
+                "index.");
+
+        using ElementVec = typename array_or_vector<DIM, ElementType>::type;
+
+        struct PriorityNode
+        {
+            DistanceType distance;
+            NodePtr      node;
+            ElementVec   bound;
+
+            bool operator<(const PriorityNode& other) const
+            {
+                return distance > other.distance;
+            }
+        };
+
+        const auto dims = (DIM > 0 ? DIM : Base::dim_);
+
+        std::priority_queue<PriorityNode> queue;
+        queue.push({0, Base::root_node_, {vec, vec + dims}});
+
+        auto worst_dist = result.worstDist();
+
+        while (!queue.empty())
+        {
+            const auto priority_node = queue.top();
+            const auto node          = priority_node.node;
+            queue.pop();
+
+            if (worst_dist < priority_node.distance) continue;
+
+            if (!node->child1)
+            {
+                if (!processLeaf(result, vec, node))
+                {
+                    if (searchParams.sorted) result.sort();
+                    return result.full();
+                }
+                worst_dist = result.worstDist();  // update
+                continue;
+            }
+
+            const auto idx        = node->node_type.sub.divfeat;
+            const auto node_bound = priority_node.bound[idx];
+            const auto low_bound  = node->node_type.sub.divlow;
+            const auto high_bound = node->node_type.sub.divhigh;
+
+            if (node_bound <= low_bound)
+            {
+                queue.push(
+                    {priority_node.distance, node->child1,
+                     priority_node.bound});
+            }
+            else
+            {
+                auto child_bound = priority_node.bound;
+                child_bound[idx] = low_bound;
+
+                const auto distance =
+                    distance_.evalMetric(vec, &child_bound[0], dims);
+                if (distance < worst_dist)
+                    queue.push({distance, node->child1, child_bound});
+            }
+
+            if (node_bound >= high_bound)
+            {
+                queue.push(
+                    {priority_node.distance, node->child2,
+                     priority_node.bound});
+            }
+            else
+            {
+                auto child_bound = priority_node.bound;
+                child_bound[idx] = high_bound;
+
+                const auto distance =
+                    distance_.evalMetric(vec, &child_bound[0], dims);
+                if (distance < worst_dist)
+                    queue.push({distance, node->child2, child_bound});
+            }
+        }
+
+        if (searchParams.sorted) result.sort();
+        return result.full();
+    }
+
     /**
      * Find all points contained within the specified bounding box. Their
      * indices are stored inside the result object.
@@ -1949,6 +2085,31 @@ class KDTreeSingleIndexAdaptor
         return true;
     }
 
+    template <class RESULTSET>
+    bool processLeaf(
+        RESULTSET& result_set, const ElementType* vec, const NodePtr node) const
+    {
+        assert(!node->child1);  // (if one node is nullptr, both are)
+
+        const auto dims = (DIM > 0 ? DIM : Base::dim_);
+        for (Offset i = node->node_type.lr.left; i < node->node_type.lr.right;
+             ++i)
+        {
+            const IndexType accessor = Base::vAcc_[i];  // reorder... : i;
+            DistanceType    dist = distance_.evalMetric(vec, accessor, dims);
+            if (dist < result_set.worstDist())
+            {
+                if (!result_set.addPoint(dist, accessor))
+                {
+                    // the resultset doesn't want to receive any more
+                    // points, we're done searching!
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
     /**
      * Performs an exact search in the tree starting from a node.
      * \tparam RESULTSET Should be any ResultSet<DistanceType>
@@ -1963,25 +2124,7 @@ class KDTreeSingleIndexAdaptor
     {
         // If this is a leaf node, then do check and return.
         if (!node->child1)  // (if one node is nullptr, both are)
-        {
-            for (Offset i = node->node_type.lr.left;
-                 i < node->node_type.lr.right; ++i)
-            {
-                const IndexType accessor = Base::vAcc_[i];  // reorder... : i;
-                DistanceType    dist     = distance_.evalMetric(
-                           vec, accessor, (DIM > 0 ? DIM : Base::dim_));
-                if (dist < result_set.worstDist())
-                {
-                    if (!result_set.addPoint(dist, Base::vAcc_[i]))
-                    {
-                        // the resultset doesn't want to receive any more
-                        // points, we're done searching!
-                        return false;
-                    }
-                }
-            }
-            return true;
-        }
+            return processLeaf(result_set, vec, node);
 
         /* Which child branch should be taken first? */
         Dimension    idx   = node->node_type.sub.divfeat;

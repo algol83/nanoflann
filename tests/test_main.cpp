@@ -30,6 +30,7 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cmath>  // for abs()
 #include <cstdlib>
 #include <iostream>
@@ -221,6 +222,86 @@ void L2_vs_bruteforce_test(
                 << "For: numToSearch=" << numToSearch
                 << " out_dists_sqr[i]=" << out_dists_sqr[i] << "\n";
         }
+    }
+}
+
+template <typename NUM>
+void L2_vs_fast_L2(
+    const size_t nSamples, const size_t DIM, const size_t numToSearch)
+{
+    std::vector<std::vector<NUM>> samples;
+
+    const NUM max_range = NUM(20.0);
+
+    // Generate points:
+    generateRandomPointCloud(samples, nSamples, DIM, max_range);
+
+    // Query point:
+    std::vector<NUM> query_pt(DIM);
+    for (size_t d = 0; d < DIM; d++)
+        query_pt[d] = static_cast<NUM>(max_range * (rand() % 1000) / (1000.0));
+
+    // construct a kd-tree index:
+    // Dimensionality set at run-time (default: L2)
+    // ------------------------------------------------------------
+    typedef KDTreeVectorOfVectorsAdaptor<std::vector<std::vector<NUM>>, NUM>
+        my_kd_tree_t;
+
+    my_kd_tree_t mat_index(DIM /*dim*/, samples, 10 /* max leaf */);
+
+    // do a knn search
+    const size_t        num_results = numToSearch;
+    std::vector<size_t> ret_indexes(num_results);
+    std::vector<NUM>    out_dists_sqr(num_results);
+
+    nanoflann::KNNResultSet<NUM> resultSet(num_results);
+
+    resultSet.init(&ret_indexes[0], &out_dists_sqr[0]);
+    auto start_ts = std::chrono::steady_clock::now();
+    mat_index.index->findNeighbors(resultSet, &query_pt[0]);
+    const auto find_duration = std::chrono::steady_clock::now() - start_ts;
+
+    const auto nFound = resultSet.size();
+
+    EXPECT_TRUE(nFound > 0);
+    if (resultSet.full())
+    {
+        EXPECT_EQ(resultSet.worstDist(), out_dists_sqr.at(nFound - 1));
+    }
+
+    // do a knn fast search:
+    std::vector<size_t> fast_ret_indexes(num_results);
+    std::vector<NUM>    fast_out_dists_sqr(num_results);
+
+    nanoflann::KNNResultSet<NUM> fast_resultSet(num_results);
+
+    fast_resultSet.init(&fast_ret_indexes[0], &fast_out_dists_sqr[0]);
+    start_ts = std::chrono::steady_clock::now();
+    mat_index.index->findNeighbors2(fast_resultSet, &query_pt[0]);
+    const auto fast_find_duration = std::chrono::steady_clock::now() - start_ts;
+
+    const auto fast_nFound = fast_resultSet.size();
+
+    EXPECT_TRUE(fast_nFound > 0);
+    if (fast_resultSet.full())
+    {
+        EXPECT_EQ(
+            fast_resultSet.worstDist(), fast_out_dists_sqr.at(nFound - 1));
+    }
+
+    // Compare:
+    EXPECT_GT(find_duration.count(), fast_find_duration.count());
+    ASSERT_EQ(nFound, fast_nFound);
+    for (size_t i = 0; i < nFound; ++i)
+    {
+        // Indexes with the same distance may have different orders:
+        /*
+        EXPECT_EQ(ret_indexes[i], fast_ret_indexes[i])
+            << "ind=" << i << "; dist=" << out_dists_sqr[i]
+            << "; fast_dist=" << fast_out_dists_sqr[i];
+        // Distances must be in exact order:
+        */
+        EXPECT_NEAR(out_dists_sqr[i], fast_out_dists_sqr[i], 1e-3) << i;
     }
 }
 
@@ -717,6 +798,24 @@ TEST(kdtree, L2_vs_bruteforce)
             L2_vs_bruteforce_test<double>(100, 2, knn);
             L2_vs_bruteforce_test<double>(100, 3, knn);
             L2_vs_bruteforce_test<double>(100, 7, knn);
+        }
+    }
+}
+
+TEST(kdtree, L2_vs_fast_L2)
+{
+    srand(static_cast<unsigned int>(time(nullptr)));
+    for (int knn = 1; knn < 20; knn += 3)
+    {
+        for (int i = 0; i < 10; i++)
+        {
+            L2_vs_fast_L2<float>(100000, 2, knn);
+            L2_vs_fast_L2<float>(100000, 3, knn);
+            L2_vs_fast_L2<float>(100000, 7, knn);
+
+            L2_vs_fast_L2<double>(100000, 2, knn);
+            L2_vs_fast_L2<double>(100000, 3, knn);
+            L2_vs_fast_L2<double>(100000, 7, knn);
         }
     }
 }
